@@ -8,6 +8,7 @@ import type { BrowserState, PageController } from '@page-agent/page-controller'
 import chalk from 'chalk'
 import * as z from 'zod/v4'
 
+import CONVERSATION_RULES from './prompts/conversation_rules.md?raw'
 import SYSTEM_PROMPT from './prompts/system_prompt.md?raw'
 import { tools } from './tools'
 import type {
@@ -16,6 +17,7 @@ import type {
 	AgentReflection,
 	AgentStatus,
 	AgentStepEvent,
+	ConversationTurn,
 	ExecutionResult,
 	HistoricalEvent,
 	MacroToolInput,
@@ -69,6 +71,8 @@ export class PageAgentCore extends EventTarget {
 	taskId = ''
 	/** History events */
 	history: HistoricalEvent[] = []
+	/** Compressed memory of finished tasks, see `config.persistentMemory` */
+	turns: ConversationTurn[] = []
 	/** Whether this agent has been disposed */
 	disposed = false
 
@@ -194,6 +198,57 @@ export class PageAgentCore extends EventTarget {
 	}
 
 	/**
+	 * Reduce the task that just finished to a compact memory entry.
+	 * Reuses the reflection lines the model already produced, so this costs no
+	 * extra LLM call.
+	 * @experimental
+	 */
+	#archiveTurn(): void {
+		if (!this.config.persistentMemory) return
+		if (!this.task && this.history.length === 0) return
+
+		const notes = this.history
+			.filter((e): e is AgentStepEvent => e.type === 'step')
+			.map((e) => {
+				const reflection = [
+					e.reflection.evaluation_previous_goal,
+					e.reflection.memory,
+					e.reflection.next_goal,
+				]
+					.filter(Boolean)
+					.join(' | ')
+				return `- ${reflection} => ${e.action.name}`
+			})
+
+		this.turns.push({
+			task: this.task,
+			success: this.#lastResult?.success ?? false,
+			answer: this.#lastResult?.data ?? '',
+			notes: notes.join('\n'),
+		})
+
+		const max = this.config.maxMemoryTurns ?? 10
+		if (this.turns.length > max) this.turns = this.turns.slice(-max)
+	}
+
+	/**
+	 * End the conversation: drop the cross-task memory and the current history.
+	 * Only meaningful with `config.persistentMemory`.
+	 * @experimental
+	 */
+	startNewSession(): void {
+		if (this.#status === 'running')
+			throw new Error('Cannot start a new session while a task is running.')
+		this.turns = []
+		this.history = []
+		this.task = ''
+		this.#observations = []
+		this.#lastResult = null
+		this.#setStatus('idle')
+		this.#emitHistoryChange()
+	}
+
+	/**
 	 * Stop the current task and wait until the run has fully settled (including lifecycle hooks).
 	 * @note never await .stop() in a lifecycle hook.
 	 */
@@ -212,6 +267,8 @@ export class PageAgentCore extends EventTarget {
 		if (this.disposed) throw new Error('PageAgent has been disposed. Create a new instance.')
 		if (this.#status === 'running') throw new Error('A task is already running.')
 		if (!task) throw new Error('Task is required')
+
+		this.#archiveTurn()
 
 		this.task = task
 		this.taskId = uid()
@@ -474,7 +531,9 @@ export class PageAgentCore extends EventTarget {
 	 */
 	#getSystemPrompt(): string {
 		if (this.config.customSystemPrompt) {
-			return this.config.customSystemPrompt
+			return this.config.persistentMemory
+				? this.config.customSystemPrompt + CONVERSATION_RULES
+				: this.config.customSystemPrompt
 		}
 
 		const targetLanguage = this.config.language === 'zh-CN' ? '中文' : 'English'
@@ -483,7 +542,7 @@ export class PageAgentCore extends EventTarget {
 			`Default working language: **${targetLanguage}**`
 		)
 
-		return systemPrompt
+		return this.config.persistentMemory ? systemPrompt + CONVERSATION_RULES : systemPrompt
 	}
 
 	/**
@@ -589,6 +648,19 @@ export class PageAgentCore extends EventTarget {
 		//  - <user_request>
 		//  - <step_info>
 		// <agent_state>
+
+		// <conversation> (optional): compressed memory of previous tasks
+		if (this.turns.length > 0) {
+			prompt += '<conversation>\n'
+			this.turns.forEach((turn, i) => {
+				prompt += `<turn_${i + 1}>\n`
+				prompt += `User: ${turn.task}\n`
+				prompt += `Agent (${turn.success ? 'success' : 'failed'}): ${turn.answer}\n`
+				if (turn.notes) prompt += `Step notes:\n${turn.notes}\n`
+				prompt += `</turn_${i + 1}>\n`
+			})
+			prompt += '</conversation>\n\n'
+		}
 
 		const stepCount = this.history.filter((e) => e.type === 'step').length
 

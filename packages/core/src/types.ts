@@ -15,6 +15,22 @@ export interface AgentConfig extends LLMConfig {
 	 * @default 40
 	 */
 	maxSteps?: number
+	/**
+	 * Keep a compressed memory of finished tasks across `execute()` calls, so that
+	 * consecutive requests behave like one conversation. The finished task is reduced
+	 * to a compact digest and injected as a `<conversation>` block on the next run.
+	 * No extra LLM call is needed: the model's own per-step `memory` lines are reused.
+	 * @experimental
+	 * @default false
+	 */
+	persistentMemory?: boolean
+
+	/**
+	 * How many finished tasks to keep when `persistentMemory` is enabled.
+	 * @experimental
+	 * @default 10
+	 */
+	maxMemoryTurns?: number
 
 	/**
 	 * Custom tools to extend PageAgent capabilities
@@ -254,6 +270,23 @@ export interface AgentErrorEvent {
 /**
  * Union type for all history events
  */
+/**
+ * Compressed memory of one finished task, kept across `execute()` calls when
+ * `config.persistentMemory` is enabled.
+ *
+ * @experimental
+ */
+export interface ConversationTurn {
+	/** The request of that task */
+	task: string
+	/** Whether the task reported success through the `done` action */
+	success: boolean
+	/** The answer returned by the `done` action */
+	answer: string
+	/** One line per step, built from the model's own reflection lines */
+	notes: string
+}
+
 export type HistoricalEvent =
 	AgentStepEvent | ObservationEvent | UserTakeoverEvent | RetryEvent | AgentErrorEvent
 

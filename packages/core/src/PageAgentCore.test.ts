@@ -1,5 +1,5 @@
 import type { BrowserState, PageController } from '@page-agent/page-controller'
-import { describe, expect, it, vi } from 'vitest'
+import { type Mock, describe, expect, it, vi } from 'vitest'
 import * as z from 'zod/v4'
 
 import { PageAgentCore, tool } from './PageAgentCore'
@@ -67,6 +67,13 @@ function createAgent(
 
 function createFetchMock() {
 	return vi.fn<TestFetch>()
+}
+
+/** Extract the user prompt the LLM received on a given call. */
+function userPromptOf(fetchMock: Mock, callIndex: number): string {
+	const init = fetchMock.mock.calls[callIndex]![1] as RequestInit
+	const body = JSON.parse(init.body as string)
+	return body.messages.find((m: { role: string }) => m.role === 'user').content
 }
 
 function onceActivity(
@@ -361,5 +368,68 @@ describe.concurrent('PageAgentCore lifecycle', () => {
 			await expect(task).resolves.toMatchObject({ success: false, data: 'Task aborted' })
 			expect(agent.status).toBe('stopped')
 		})
+	})
+})
+
+describe('PageAgentCore conversation memory', () => {
+	it('keeps a compressed digest of the previous task when enabled', async () => {
+		const fetchMock = createFetchMock()
+			.mockResolvedValueOnce(doneResponse('first answer'))
+			.mockResolvedValueOnce(doneResponse('second answer'))
+		const agent = createAgent(fetchMock, { persistentMemory: true })
+
+		await agent.execute('first task')
+		await agent.execute('second task')
+
+		expect(agent.turns).toHaveLength(1)
+		expect(agent.turns[0]).toMatchObject({
+			task: 'first task',
+			success: true,
+			answer: 'first answer',
+		})
+
+		const userPrompt = userPromptOf(fetchMock, 1)
+		expect(userPrompt).toContain('<conversation>')
+		expect(userPrompt).toContain('first task')
+		expect(userPrompt).toContain('first answer')
+	})
+
+	it('keeps every task independent by default', async () => {
+		const fetchMock = createFetchMock()
+			.mockResolvedValueOnce(doneResponse('first answer'))
+			.mockResolvedValueOnce(doneResponse('second answer'))
+		const agent = createAgent(fetchMock)
+
+		await agent.execute('first task')
+		await agent.execute('second task')
+
+		expect(agent.turns).toHaveLength(0)
+		const userPrompt = userPromptOf(fetchMock, 1)
+		expect(userPrompt).not.toContain('<conversation>')
+	})
+
+	it('startNewSession() drops the conversation memory', async () => {
+		const fetchMock = createFetchMock()
+			.mockResolvedValueOnce(doneResponse('first answer'))
+			.mockResolvedValueOnce(doneResponse('second answer'))
+		const agent = createAgent(fetchMock, { persistentMemory: true })
+
+		await agent.execute('first task')
+		agent.startNewSession()
+		await agent.execute('second task')
+
+		expect(agent.turns).toHaveLength(0)
+		const userPrompt = userPromptOf(fetchMock, 1)
+		expect(userPrompt).not.toContain('<conversation>')
+	})
+
+	it('drops the oldest turns beyond maxMemoryTurns', async () => {
+		const fetchMock = createFetchMock()
+		for (let i = 0; i < 4; i++) fetchMock.mockResolvedValueOnce(doneResponse(`answer ${i}`))
+		const agent = createAgent(fetchMock, { persistentMemory: true, maxMemoryTurns: 2 })
+
+		for (let i = 0; i < 4; i++) await agent.execute(`task ${i}`)
+
+		expect(agent.turns.map((t) => t.task)).toEqual(['task 1', 'task 2'])
 	})
 })
